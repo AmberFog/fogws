@@ -1,2 +1,2 @@
-# fog_ws
+# fogws
 Rust Powered Websocket
