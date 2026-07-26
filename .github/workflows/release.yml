@@ -1,0 +1,309 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check tag, Python version, and Cargo version
+        shell: python
+        run: |
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          ref = os.environ["GITHUB_REF"]
+          if not ref.startswith("refs/tags/v"):
+              raise SystemExit(f"release workflow must run from a v* tag, got {ref!r}")
+
+          tag_version = ref.removeprefix("refs/tags/v")
+          pyproject_version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          cargo_toml = Path("Cargo.toml").read_text()
+          cargo_version = re.search(r'^version\s*=\s*"([^"]+)"', cargo_toml, re.MULTILINE)
+
+          if cargo_version is None:
+              raise SystemExit("Cargo.toml package version was not found")
+
+          versions = {
+              "tag": tag_version,
+              "pyproject.toml": pyproject_version,
+              "Cargo.toml": cargo_version.group(1),
+          }
+          if len(set(versions.values())) != 1:
+              raise SystemExit(f"release versions do not match: {versions}")
+
+  linux-wheels:
+    name: Build Linux wheel (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: validate-version
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up QEMU
+        if: matrix.target == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist --interpreter python3.11
+          manylinux: "2014"
+          sccache: true
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  linux-wheel-smoke:
+    name: Smoke Linux wheel (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: linux-wheels
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download x86_64 wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+
+      - name: Smoke test wheel install
+        run: python scripts/install_wheel_smoke.py --dist-dir dist
+
+  macos-wheels:
+    name: Build macOS wheel (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    needs: validate-version
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: x86_64
+            runner: macos-15-intel
+            target: x86_64
+          - name: aarch64
+            runner: macos-15
+            target: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.platform.target }}
+          args: --release --locked --out dist --interpreter python
+          sccache: true
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.platform.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos-wheel-smoke:
+    name: Smoke macOS wheel (${{ matrix.platform.name }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.platform.runner }}
+    needs: macos-wheels
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        platform:
+          - name: x86_64
+            runner: macos-15-intel
+          - name: aarch64
+            runner: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.platform.name }}
+          path: dist
+
+      - name: Smoke test wheel install
+        run: python scripts/install_wheel_smoke.py --dist-dir dist
+
+  windows-wheels:
+    name: Build Windows wheel (x64)
+    runs-on: windows-latest
+    needs: validate-version
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --out dist --interpreter python
+          sccache: true
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  windows-wheel-smoke:
+    name: Smoke Windows wheel (Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    needs: windows-wheels
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: x64
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+      - name: Smoke test wheel install
+        run: python scripts/install_wheel_smoke.py --dist-dir dist
+
+  audit-wheels:
+    name: Audit stable ABI wheels
+    runs-on: ubuntu-latest
+    needs: [linux-wheels, macos-wheels, windows-wheels]
+    timeout-minutes: 15
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install abi3audit
+        run: python -m pip install --disable-pip-version-check "abi3audit==0.0.26"
+
+      - name: Audit stable ABI compatibility
+        shell: bash
+        run: python -m abi3audit --strict --summary dist/*.whl
+
+  sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    needs: validate-version
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs:
+      - audit-wheels
+      - linux-wheel-smoke
+      - macos-wheel-smoke
+      - windows-wheel-smoke
+      - sdist
+    environment: pypi
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: dist
+          merge-multiple: true
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

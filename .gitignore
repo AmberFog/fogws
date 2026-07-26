@@ -1,0 +1,33 @@
+# Rust / Cargo
+/debug/
+/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Rust tooling
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local context bridge
+CONTEXT.md

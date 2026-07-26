@@ -1,0 +1,30 @@
+[flake8]
+max-line-length = 120
+max-line-complexity = 16
+max-cognitive-score = 14
+max-try-body-length = 4
+format = wemake
+select = WPS
+
+# Ruff owns formatting, imports, pyflakes/pycodestyle, pydocstyle, security,
+# pytest rules and docs/examples print policy. Wemake is an additional
+# architecture and complexity smell-check layer.
+ignore =
+    WPS110,
+    WPS300,
+    WPS301,
+    WPS332,
+    WPS410,
+
+exclude =
+    .git,
+    .mypy_cache,
+    .pytest_cache,
+    .ruff_cache,
+    .venv,
+    build,
+    dist,
+    target,
+
+per-file-ignores =
+    fogws/__init__.py: WPS412

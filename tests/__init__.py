@@ -1,0 +1,1 @@
+"""FogWS test suite."""

@@ -1,0 +1,28 @@
+[package]
+name = "fogws"
+version = "0.0.1"
+description = "Observable Rust-powered WebSocket library for Python."
+edition = "2024"
+rust-version = "1.97.1"
+homepage = "https://github.com/AmberFog/fogws"
+license = "MIT"
+publish = false
+repository = "https://github.com/AmberFog/fogws"
+
+[lib]
+name = "fogws"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[dependencies.pyo3]
+version = "0.29.0"
+features = ["abi3-py311"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
