@@ -31,3 +31,6 @@ dist/
 
 # Local context bridge
 CONTEXT.md
+
+# Machine-local Codex MCP configuration
+/.codex/config.toml
