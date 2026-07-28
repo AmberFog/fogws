@@ -134,4 +134,4 @@ jobs:
           uv pip install --python .wheel-smoke/bin/python dist/*.whl
 
       - name: Smoke test installed wheel
-        run: .wheel-smoke/bin/python -c "import fogws; print(fogws.__version__)"
+        run: .wheel-smoke/bin/python -P -c "import fogws; print(fogws.__version__)"
