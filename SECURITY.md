@@ -4,9 +4,6 @@ FogWS is security-sensitive because it will process untrusted network input,
 perform HTTP Upgrade and WebSocket framing, negotiate compression, manage TLS
 and proxies, and expose protocol state through a Python/Rust boundary.
 
-The current pre-alpha package provides a minimal client for plain `ws://`
-connections. TLS, proxies and the server role aren't implemented yet.
-
 ## Supported Versions
 
 Security fixes are provided on a best-effort basis for the active development

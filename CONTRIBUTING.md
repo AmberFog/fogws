@@ -6,10 +6,6 @@ FogWS is a pre-alpha Python WebSocket library with a Rust execution core. The
 project is intentionally focused on explicit lifecycle, bounded resources,
 protocol correctness, observability and measurable performance.
 
-The current repository provides a minimal asyncio client for plain `ws://`
-connections through the Rust core. Discuss public API, runtime, protocol
-dependency and extension-point changes before implementing them.
-
 AI tools are allowed, but they don't replace engineering ownership. Every
 submitted change must be understood, reviewed, tested and maintainable by its
 human contributor.
