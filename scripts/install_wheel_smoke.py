@@ -16,7 +16,26 @@ SMOKE_SCRIPT = textwrap.dedent(
 
     distribution_version = version("fogws")
     assert distribution_version == fogws.__version__
-    assert fogws.__all__ == ("__version__",)
+    assert fogws.__all__ == (
+        "DEFAULT_CLOSE_TIMEOUT",
+        "DEFAULT_MAX_BUFFERED_BYTES",
+        "DEFAULT_MAX_MESSAGE_SIZE",
+        "DEFAULT_MAX_QUEUE",
+        "ConcurrencyError",
+        "Connection",
+        "ConnectionClosed",
+        "ConnectionClosedError",
+        "ConnectionClosedOK",
+        "ConnectionFailedError",
+        "FogWSError",
+        "InvalidURIError",
+        "LoopAffinityError",
+        "ResourceLimitError",
+        "RuntimeContextError",
+        "__version__",
+        "connect",
+    )
+    assert all(hasattr(fogws, name) for name in fogws.__all__)
     """,
 )
 
