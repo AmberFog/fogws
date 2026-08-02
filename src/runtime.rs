@@ -1,100 +1,76 @@
 use std::sync::OnceLock;
 
-use pyo3::prelude::*;
+use pyo3::{exceptions::PyImportError, prelude::*, types::PyTuple};
 
 use crate::py::RuntimeContextError;
 
 pub const RUNTIME_WORKER_THREADS: usize = 2;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RuntimeOwner {
-    interpreter: usize,
-    process: u32,
+static OWNER_PROCESS: OnceLock<u32> = OnceLock::new();
+
+pub fn validate_import_context(py: Python<'_>) -> PyResult<()> {
+    ensure_main_interpreter(py)?;
+    claim_or_validate_process()
 }
 
-static OWNER: OnceLock<RuntimeOwner> = OnceLock::new();
-
-pub fn configure(py: Python<'_>) -> PyResult<()> {
-    claim_or_validate_context(py)?;
-
+pub fn configure() {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .enable_all()
         .thread_name("fogws-runtime")
         .worker_threads(RUNTIME_WORKER_THREADS);
     pyo3_async_runtimes::tokio::init(builder);
-    Ok(())
 }
 
-pub fn ensure_current_context(py: Python<'_>) -> PyResult<()> {
-    claim_or_validate_context(py)
+pub fn ensure_current_process() -> PyResult<()> {
+    claim_or_validate_process()
 }
 
-fn claim_or_validate_context(py: Python<'_>) -> PyResult<()> {
+pub fn is_owner_process() -> bool {
+    OWNER_PROCESS
+        .get()
+        .is_none_or(|owner_process| *owner_process == std::process::id())
+}
+
+fn claim_or_validate_process() -> PyResult<()> {
     let current_process = std::process::id();
-    let current_interpreter = interpreter_identity(py)?;
-    let current = RuntimeOwner {
-        interpreter: current_interpreter,
-        process: current_process,
-    };
-    let owner = OWNER.get_or_init(|| current);
-
-    if owner.process != current.process {
+    let owner_process = OWNER_PROCESS.get_or_init(|| current_process);
+    if *owner_process != current_process {
         return Err(RuntimeContextError::new_err(
             "FogWS was initialized before fork; create a fresh interpreter process before using it",
         ));
     }
-    if owner.interpreter != current.interpreter {
-        return Err(RuntimeContextError::new_err(
-            "FogWS supports only the Python interpreter that initialized its process-wide runtime",
+    Ok(())
+}
+
+fn ensure_main_interpreter(py: Python<'_>) -> PyResult<()> {
+    let interpreters = py
+        .import("_interpreters")
+        .or_else(|_| py.import("_xxsubinterpreters"))?;
+    let current = extract_interpreter_id(&interpreters.call_method0("get_current")?)?;
+    let main = extract_interpreter_id(&interpreters.call_method0("get_main")?)?;
+    if current != main {
+        return Err(PyImportError::new_err(
+            "module fogws._fogws does not support loading in subinterpreters",
         ));
     }
     Ok(())
 }
 
-fn interpreter_identity(py: Python<'_>) -> PyResult<usize> {
-    Ok(py.import("sys")?.getattr("modules")?.as_ptr() as usize)
+fn extract_interpreter_id(identity: &Bound<'_, PyAny>) -> PyResult<i64> {
+    if let Ok(details) = identity.cast::<PyTuple>() {
+        return details.get_item(0)?.extract();
+    }
+    identity.call_method0("__index__")?.extract()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, Barrier, OnceLock},
-        thread,
-    };
-
-    use super::RuntimeOwner;
-
     #[test]
     fn pyo3_runtime_is_a_process_singleton() {
         let first = std::ptr::from_ref(pyo3_async_runtimes::tokio::get_runtime());
         let second = std::ptr::from_ref(pyo3_async_runtimes::tokio::get_runtime());
 
         assert_eq!(first, second);
-    }
-
-    #[test]
-    fn runtime_owner_is_claimed_as_one_immutable_tuple() {
-        let owner = Arc::new(OnceLock::new());
-        let barrier = Arc::new(Barrier::new(2));
-        let claims = [11, 22].map(|interpreter| {
-            let owner = Arc::clone(&owner);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                let candidate = RuntimeOwner {
-                    interpreter,
-                    process: 7,
-                };
-                barrier.wait();
-                *owner.get_or_init(|| candidate) == candidate
-            })
-        });
-        let accepted = claims
-            .into_iter()
-            .map(|claim| claim.join().unwrap())
-            .filter(|accepted| *accepted)
-            .count();
-
-        assert_eq!(accepted, 1);
     }
 }

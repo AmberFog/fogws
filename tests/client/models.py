@@ -9,7 +9,7 @@ class LoopbackEndpoint:
 
 
 @dataclass(frozen=True, slots=True)
-class BackpressuredEndpoint:
+class TerminalFrameEndpoint:
     trigger: asyncio.Event
     upgraded: asyncio.Event
     uri: str
@@ -24,6 +24,7 @@ class StalledHandshakeEndpoint:
 
 @dataclass(frozen=True, slots=True)
 class UnresponsiveCloseEndpoint:
+    close_received: asyncio.Event
     disconnected: asyncio.Event
     upgraded: asyncio.Event
     uri: str

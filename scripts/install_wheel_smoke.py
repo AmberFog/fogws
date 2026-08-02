@@ -10,6 +10,7 @@ import textwrap
 SMOKE_SCRIPT = textwrap.dedent(
     """
     from importlib.metadata import version
+    from pathlib import Path
 
     import fogws
 
@@ -36,6 +37,9 @@ SMOKE_SCRIPT = textwrap.dedent(
         "connect",
     )
     assert all(hasattr(fogws, name) for name in fogws.__all__)
+    package_dir = Path(fogws.__file__).parent
+    assert (package_dir / "py.typed").is_file()
+    assert (package_dir / "_fogws.pyi").is_file()
     """,
 )
 

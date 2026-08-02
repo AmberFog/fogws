@@ -1,7 +1,6 @@
 import asyncio
 import contextlib
 import gc
-import socket
 import sys
 from weakref import ReferenceType, ref
 
@@ -18,18 +17,14 @@ from .constants import (
     EXPECTED_NORMAL_CLOSE_CODE,
 )
 from .models import (
-    BackpressuredEndpoint,
     LoopbackEndpoint,
     StalledHandshakeEndpoint,
+    TerminalFrameEndpoint,
     UnresponsiveCloseEndpoint,
 )
 
 
 pytestmark = pytest.mark.timeout(5)
-
-BACKPRESSURED_MESSAGE_BYTES = 8 * 1024 * 1024
-BACKPRESSURE_SETTLE_SECONDS = 0.05
-BOUNDED_CLOSE_TIMEOUT_SECONDS = 0.05
 
 
 @pytest.mark.asyncio
@@ -84,8 +79,10 @@ async def test_abnormal_peer_close_has_exact_type(
     with pytest.raises(fogws.ConnectionClosedError, match="code 1011") as error:
         await connection.receive()
     assert error.value.code == EXPECTED_ERROR_CLOSE_CODE
-    assert error.value.reason == "failed"
+    assert error.value.reason == "failed\nforged-log-entry"
     assert error.value.initiated_by_local is False
+    assert error.value.reason not in str(error.value)
+    assert "\n" not in str(error.value)
 
     with pytest.raises(fogws.ConnectionClosedError, match="code 1011"):
         await connection.close()
@@ -93,12 +90,27 @@ async def test_abnormal_peer_close_has_exact_type(
 
 @pytest.mark.asyncio
 async def test_connection_refusal_has_exact_type() -> None:
-    with socket.socket() as reserved_socket:
-        reserved_socket.bind(("127.0.0.1", 0))
-        _, port = reserved_socket.getsockname()
+    handler_finished = asyncio.Event()
 
-    with pytest.raises(fogws.ConnectionFailedError, match="connection failed"):
-        await fogws.connect(f"ws://127.0.0.1:{port}/refused")
+    async def refuse_connection(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        del reader
+        writer.close()
+        await writer.wait_closed()
+        handler_finished.set()
+
+    server = await asyncio.start_server(refuse_connection, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    host, port = socket.getsockname()[:2]
+    try:
+        with pytest.raises(fogws.ConnectionFailedError, match="connection failed"):
+            await fogws.connect(f"ws://{host}:{port}/refused")
+        await asyncio.wait_for(handler_finished.wait(), timeout=1)
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 @pytest.mark.asyncio
@@ -126,7 +138,7 @@ async def test_close_cancellation_keeps_native_timeout_cleanup_running(
     await asyncio.wait_for(unresponsive_close_endpoint.upgraded.wait(), timeout=1)
 
     close_task = asyncio.create_task(connection.close())
-    await asyncio.sleep(0)
+    await asyncio.wait_for(unresponsive_close_endpoint.close_received.wait(), timeout=1)
     close_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await close_task
@@ -140,34 +152,38 @@ async def test_close_cancellation_keeps_native_timeout_cleanup_running(
 
 
 @pytest.mark.asyncio
-async def test_peer_close_bounds_backpressured_writer_cleanup(
-    backpressured_close_endpoint: BackpressuredEndpoint,
+async def test_peer_close_preserves_one_typed_outcome_across_operations(
+    peer_close_endpoint: TerminalFrameEndpoint,
 ) -> None:
-    connection, send_task = await _start_backpressured_send(backpressured_close_endpoint)
-    backpressured_close_endpoint.trigger.set()
+    connection = await _start_terminal_frame_connection(peer_close_endpoint)
 
-    with pytest.raises(fogws.ConnectionClosedOK):
+    with pytest.raises(fogws.ConnectionClosedOK) as receive_error:
         await asyncio.wait_for(connection.receive(), timeout=1)
-    with pytest.raises(fogws.ConnectionClosedOK):
-        await asyncio.wait_for(send_task, timeout=1)
+    with pytest.raises(fogws.ConnectionClosedOK) as send_error:
+        await connection.send_text("after-close")
+    assert send_error.value.code == receive_error.value.code
+    assert send_error.value.reason == receive_error.value.reason
+    assert send_error.value.initiated_by_local is receive_error.value.initiated_by_local
     await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_protocol_error_aborts_backpressured_writer(
-    backpressured_protocol_error_endpoint: BackpressuredEndpoint,
+async def test_protocol_error_preserves_one_typed_outcome_across_operations(
+    protocol_error_endpoint: TerminalFrameEndpoint,
 ) -> None:
-    connection, send_task = await _start_backpressured_send(
-        backpressured_protocol_error_endpoint,
-    )
-    backpressured_protocol_error_endpoint.trigger.set()
+    connection = await _start_terminal_frame_connection(protocol_error_endpoint)
 
-    with pytest.raises(fogws.ConnectionClosedError, match="WebSocket receive failed"):
+    with pytest.raises(fogws.ConnectionClosedError, match="WebSocket receive failed") as receive_error:
         await asyncio.wait_for(connection.receive(), timeout=1)
-    with pytest.raises(fogws.ConnectionClosedError, match="WebSocket receive failed"):
-        await asyncio.wait_for(send_task, timeout=1)
-    with pytest.raises(fogws.ConnectionClosedError, match="WebSocket receive failed"):
+    with pytest.raises(fogws.ConnectionClosedError, match="WebSocket receive failed") as send_error:
+        await connection.send_text("after-error")
+    with pytest.raises(fogws.ConnectionClosedError, match="WebSocket receive failed") as close_error:
         await connection.close()
+    for error in (send_error.value, close_error.value):
+        assert str(error) == str(receive_error.value)
+        assert error.code == receive_error.value.code
+        assert error.reason == receive_error.value.reason
+        assert error.initiated_by_local is receive_error.value.initiated_by_local
 
 
 @pytest.mark.asyncio
@@ -247,6 +263,7 @@ async def test_dropping_connection_cancels_retained_native_receive(
 @pytest.mark.asyncio
 async def test_drop_aborts_receive_after_creator_loop_is_closed(
     loopback_endpoint: LoopbackEndpoint,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     def create_abandoned_connection() -> fogws.Connection:
         event_loop = asyncio.new_event_loop()
@@ -270,6 +287,8 @@ async def test_drop_aborts_receive_after_creator_loop_is_closed(
     gc.collect()
 
     await asyncio.wait_for(loopback_endpoint.disconnected.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.asyncio
@@ -301,6 +320,45 @@ async def test_cross_loop_use_fails_explicitly(
     with pytest.raises(fogws.LoopAffinityError, match="loop that created"):
         await asyncio.to_thread(asyncio.run, send_from_new_loop())
 
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_receive_does_not_poison_owner_loop(
+    loopback_endpoint: LoopbackEndpoint,
+) -> None:
+    connection = await fogws.connect(loopback_endpoint.uri)
+
+    async def receive_from_new_loop() -> None:
+        await connection.receive()
+
+    with pytest.raises(fogws.LoopAffinityError, match="loop that created"):
+        await asyncio.to_thread(asyncio.run, receive_from_new_loop())
+
+    await connection.send_text("owner-loop")
+    assert await connection.receive() == "owner-loop"
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_receive_preserves_retained_message(
+    loopback_endpoint: LoopbackEndpoint,
+) -> None:
+    connection = await fogws.connect(loopback_endpoint.uri)
+    receive_task = asyncio.create_task(connection.receive())
+    await asyncio.sleep(0)
+    receive_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await receive_task
+
+    async def receive_from_new_loop() -> None:
+        await connection.receive()
+
+    with pytest.raises(fogws.LoopAffinityError, match="loop that created"):
+        await asyncio.to_thread(asyncio.run, receive_from_new_loop())
+
+    await connection.send_text("retained-for-owner")
+    assert await connection.receive() == "retained-for-owner"
     await connection.close()
 
 
@@ -400,6 +458,27 @@ async def test_outbound_message_limit_is_enforced(
 
 
 @pytest.mark.asyncio
+async def test_text_limit_is_checked_before_utf8_conversion(
+    loopback_endpoint: LoopbackEndpoint,
+) -> None:
+    connection = await fogws.connect(
+        loopback_endpoint.uri,
+        max_message_size=4,
+        max_buffered_bytes=4,
+    )
+
+    with pytest.raises(fogws.ResourceLimitError, match="maximum is 4"):
+        await connection.send_text("\ud800" * 5)
+    with pytest.raises(fogws.ResourceLimitError, match="maximum is 4"):
+        await connection.send_text("ééé")
+
+    await connection.send_text("éé")
+    assert await connection.receive() == "éé"
+
+    await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_inbound_message_limit_closes_connection(
     loopback_endpoint: LoopbackEndpoint,
 ) -> None:
@@ -424,6 +503,13 @@ async def test_non_ws_scheme_is_rejected(
         await fogws.connect(secure_uri)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("port", ["", "abc", "65536", "99999"])
+async def test_invalid_explicit_port_is_rejected_before_network_use(port: str) -> None:
+    with pytest.raises(fogws.InvalidURIError, match="invalid explicit port"):
+        await fogws.connect(f"ws://127.0.0.1:{port}/invalid-port")
+
+
 def test_public_limit_defaults_are_named_and_finite() -> None:
     assert fogws.DEFAULT_MAX_QUEUE == EXPECTED_MAX_QUEUE
     assert fogws.DEFAULT_MAX_MESSAGE_SIZE == EXPECTED_MAX_MESSAGE_SIZE
@@ -431,19 +517,10 @@ def test_public_limit_defaults_are_named_and_finite() -> None:
     assert fogws.DEFAULT_CLOSE_TIMEOUT == EXPECTED_CLOSE_TIMEOUT
 
 
-async def _start_backpressured_send(
-    endpoint: BackpressuredEndpoint,
-) -> tuple[fogws.Connection, asyncio.Task[None]]:
-    connection = await fogws.connect(
-        endpoint.uri,
-        max_message_size=BACKPRESSURED_MESSAGE_BYTES,
-        max_buffered_bytes=BACKPRESSURED_MESSAGE_BYTES,
-        close_timeout=BOUNDED_CLOSE_TIMEOUT_SECONDS,
-    )
+async def _start_terminal_frame_connection(
+    endpoint: TerminalFrameEndpoint,
+) -> fogws.Connection:
+    connection = await fogws.connect(endpoint.uri)
     await endpoint.upgraded.wait()
-    send_task = asyncio.create_task(
-        connection.send_bytes(b"x" * BACKPRESSURED_MESSAGE_BYTES),
-    )
-    await asyncio.sleep(BACKPRESSURE_SETTLE_SECONDS)
-    assert not send_task.done(), "test peer didn't backpressure the client writer"
-    return connection, send_task
+    endpoint.trigger.set()
+    return connection

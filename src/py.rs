@@ -32,14 +32,26 @@ create_exception!(fogws, RuntimeContextError, FogWSError);
 
 #[pyclass(name = "_Connection", module = "fogws._fogws", frozen)]
 pub struct PyConnection {
-    driver: Arc<ConnectionDriver>,
+    driver: Option<Arc<ConnectionDriver>>,
     owner_loop: Py<PyAny>,
 }
 
 #[pymethods]
 impl PyConnection {
-    fn _abort(&self) {
-        self.driver.abort();
+    fn _abort(&self, pending_receive: Option<&Bound<'_, PyAny>>) {
+        if runtime::is_owner_process() {
+            if let Some(pending_receive) = pending_receive {
+                // Mark the bridge Future cancelled before abort can complete the Rust future.
+                // A closed owner loop may reject callback scheduling, but cancellation state is
+                // already visible and suppresses pyo3-async-runtimes completion delivery.
+                let _ = pending_receive.call_method0("cancel");
+            }
+            self.driver().abort();
+        }
+    }
+
+    fn _ensure_context(&self, py: Python<'_>) -> PyResult<()> {
+        self.ensure_loop_affinity(py)
     }
 
     fn send_text<'py>(
@@ -48,7 +60,10 @@ impl PyConnection {
         payload: &Bound<'py, PyString>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.ensure_loop_affinity(py)?;
-        let driver = Arc::clone(&self.driver);
+        let driver = Arc::clone(self.driver());
+        driver
+            .validate_outbound_message(payload.len()?)
+            .map_err(driver_error_to_python)?;
         let payload = payload.to_str()?;
         let admission = driver
             .try_admit_outbound(payload.len())
@@ -68,7 +83,7 @@ impl PyConnection {
         payload: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.ensure_loop_affinity(py)?;
-        let driver = Arc::clone(&self.driver);
+        let driver = Arc::clone(self.driver());
         let payload = payload.as_bytes();
         let admission = driver
             .try_admit_outbound(payload.len())
@@ -84,7 +99,7 @@ impl PyConnection {
 
     fn receive<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.ensure_loop_affinity(py)?;
-        let driver = Arc::clone(&self.driver);
+        let driver = Arc::clone(self.driver());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let message = driver.receive().await.map_err(driver_error_to_python)?;
             Python::attach(|py| match message {
@@ -98,7 +113,7 @@ impl PyConnection {
 
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.ensure_loop_affinity(py)?;
-        let driver = Arc::clone(&self.driver);
+        let driver = Arc::clone(self.driver());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             driver.close().await.map_err(driver_error_to_python)
         })
@@ -106,8 +121,14 @@ impl PyConnection {
 }
 
 impl PyConnection {
+    fn driver(&self) -> &Arc<ConnectionDriver> {
+        self.driver
+            .as_ref()
+            .expect("connection driver is present until finalization")
+    }
+
     fn ensure_loop_affinity(&self, py: Python<'_>) -> PyResult<()> {
-        runtime::ensure_current_context(py)?;
+        runtime::ensure_current_process()?;
         let current_loop = current_loop(py)?;
         if !current_loop.is(&self.owner_loop) {
             return Err(LoopAffinityError::new_err(
@@ -115,6 +136,16 @@ impl PyConnection {
             ));
         }
         Ok(())
+    }
+}
+
+impl Drop for PyConnection {
+    fn drop(&mut self) {
+        if !runtime::is_owner_process() {
+            // Tokio synchronization inherited across fork cannot be safely dropped or woken in
+            // the child. Quarantine that process-local copy until the child exits or execs.
+            std::mem::forget(self.driver.take());
+        }
     }
 }
 
@@ -135,7 +166,7 @@ fn connect(
     max_buffered_bytes: Option<Py<PyAny>>,
     close_timeout: f64,
 ) -> PyResult<Bound<'_, PyAny>> {
-    runtime::ensure_current_context(py)?;
+    runtime::ensure_current_process()?;
     let owner_loop = current_loop(py)?.unbind();
     let config = ConnectionConfig::new(
         extract_limit(py, max_queue, "max_queue", DEFAULT_MAX_QUEUE)?,
@@ -158,7 +189,10 @@ fn connect(
         let driver = client::connect(uri, config)
             .await
             .map_err(driver_error_to_python)?;
-        Ok(PyConnection { driver, owner_loop })
+        Ok(PyConnection {
+            driver: Some(driver),
+            owner_loop,
+        })
     })
 }
 
@@ -180,10 +214,15 @@ fn extract_limit(
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = module.py();
+    let connection_closed = py.get_type::<ConnectionClosed>();
+    connection_closed.setattr("code", py.None())?;
+    connection_closed.setattr("reason", "")?;
+    connection_closed.setattr("initiated_by_local", py.None())?;
+
     module.add_class::<PyConnection>()?;
     module.add_function(wrap_pyfunction!(connect, module)?)?;
     module.add("FogWSError", py.get_type::<FogWSError>())?;
-    module.add("ConnectionClosed", py.get_type::<ConnectionClosed>())?;
+    module.add("ConnectionClosed", connection_closed)?;
     module.add(
         "ConnectionClosedError",
         py.get_type::<ConnectionClosedError>(),

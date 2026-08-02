@@ -26,14 +26,7 @@ impl CloseInfo {
         } else {
             "remote endpoint"
         };
-        if self.reason.is_empty() {
-            format!("connection closed by {side} with code {code}")
-        } else {
-            format!(
-                "connection closed by {side} with code {code}: {}",
-                self.reason,
-            )
-        }
+        format!("connection closed by {side} with code {code}")
     }
 }
 
@@ -62,3 +55,24 @@ impl fmt::Display for DriverError {
 }
 
 impl std::error::Error for DriverError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{CloseInfo, DriverError};
+
+    #[test]
+    fn close_diagnostic_excludes_the_untrusted_reason() {
+        let info = CloseInfo {
+            code: Some(1011),
+            initiated_by_local: false,
+            reason: "failed\nforged-log-entry".to_owned(),
+        };
+        let diagnostic = DriverError::ClosedError(info.clone()).to_string();
+
+        assert_eq!(info.reason, "failed\nforged-log-entry");
+        assert_eq!(
+            diagnostic,
+            "connection closed by remote endpoint with code 1011"
+        );
+    }
+}

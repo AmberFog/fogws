@@ -63,6 +63,28 @@ def test_public_exceptions_have_importable_pickle_identity(
     assert restored.args == error.args
 
 
+@pytest.mark.parametrize(
+    "exception_type",
+    [
+        fogws.ConnectionClosed,
+        fogws.ConnectionClosedError,
+        fogws.ConnectionClosedOK,
+    ],
+)
+def test_public_close_exceptions_have_typed_defaults(
+    exception_type: type[fogws.ConnectionClosed],
+) -> None:
+    error = exception_type("diagnostic")
+    assert error.code is None
+    assert error.reason == ""
+    assert error.initiated_by_local is None
+
+    restored = pickle.loads(pickle.dumps(error))  # noqa: S301  # Trusted local round-trip.
+    assert restored.code is None
+    assert restored.reason == ""
+    assert restored.initiated_by_local is None
+
+
 def test_pickled_close_exception_preserves_typed_metadata() -> None:
     error = fogws.ConnectionClosedOK("clean close")
     error.code = NORMAL_CLOSE_CODE

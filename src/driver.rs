@@ -42,15 +42,6 @@ pub enum InboundMessage {
     Text(String),
 }
 
-impl InboundMessage {
-    fn len(&self) -> usize {
-        match self {
-            Self::Binary(payload) => payload.len(),
-            Self::Text(payload) => payload.len(),
-        }
-    }
-}
-
 struct InboundEnvelope {
     message: InboundMessage,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -68,9 +59,34 @@ pub struct OutboundAdmission {
     message_size: usize,
 }
 
+struct DriverTaskGuard {
+    remaining: watch::Sender<usize>,
+}
+
+impl DriverTaskGuard {
+    fn new(remaining: &watch::Sender<usize>) -> Self {
+        remaining.send_modify(|count| *count += 1);
+        Self {
+            remaining: remaining.clone(),
+        }
+    }
+}
+
+impl Drop for DriverTaskGuard {
+    fn drop(&mut self) {
+        self.remaining
+            .send_modify(|remaining| *remaining = remaining.saturating_sub(1));
+    }
+}
+
 #[derive(Clone, Copy)]
 enum WriterControl {
     Flush,
+}
+
+enum WriterEvent {
+    Control(Option<WriterControl>),
+    Outbound(Option<OutboundCommand>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +121,8 @@ pub struct ConnectionDriver {
     shutdown: watch::Sender<ShutdownSignal>,
     state: watch::Receiver<DriverState>,
     state_sender: watch::Sender<DriverState>,
+    tasks_remaining: watch::Receiver<usize>,
+    tasks_remaining_sender: watch::Sender<usize>,
     writer_abort: AbortHandle,
 }
 
@@ -119,33 +137,44 @@ impl ConnectionDriver {
         let (control_sender, control_receiver) = mpsc::channel(4);
         let (shutdown, shutdown_receiver) = watch::channel(ShutdownSignal::Running);
         let (state_sender, state) = watch::channel(DriverState::Open);
+        let (tasks_remaining_sender, tasks_remaining) = watch::channel(0);
         let closing = Arc::new(AtomicBool::new(false));
         let inbound_budget = Arc::new(Semaphore::new(config.max_buffered_bytes));
         let outbound_budget = Arc::new(Semaphore::new(config.max_buffered_bytes));
 
-        let writer_task = tokio::spawn(run_writer(
-            writer,
-            outbound_receiver,
-            control_receiver,
-            shutdown_receiver.clone(),
-            shutdown.clone(),
-            state_sender.clone(),
-        ));
+        let writer_task_guard = DriverTaskGuard::new(&tasks_remaining_sender);
+        let writer_shutdown = shutdown.clone();
+        let writer_shutdown_receiver = shutdown_receiver.clone();
+        let writer_state = state_sender.clone();
+        let writer_task = tokio::spawn(async move {
+            run_writer(
+                writer,
+                outbound_receiver,
+                control_receiver,
+                writer_shutdown_receiver,
+                writer_shutdown,
+                writer_state,
+            )
+            .await;
+            drop(writer_task_guard);
+        });
         let writer_abort = writer_task.abort_handle();
-        let reader_task = tokio::spawn(run_reader(
-            reader,
-            ReaderContext {
-                close_timeout: config.close_timeout,
-                closing: Arc::clone(&closing),
-                control: control_sender,
-                inbound: inbound_sender,
-                inbound_budget,
-                shutdown: shutdown.clone(),
-                shutdown_receiver,
-                state: state_sender.clone(),
-                writer_abort: writer_abort.clone(),
-            },
-        ));
+        let reader_task_guard = DriverTaskGuard::new(&tasks_remaining_sender);
+        let reader_context = ReaderContext {
+            close_timeout: config.close_timeout,
+            closing: Arc::clone(&closing),
+            control: control_sender,
+            inbound: inbound_sender,
+            inbound_budget,
+            shutdown: shutdown.clone(),
+            shutdown_receiver,
+            state: state_sender.clone(),
+            writer_abort: writer_abort.clone(),
+        };
+        let reader_task = tokio::spawn(async move {
+            run_reader(reader, reader_context).await;
+            drop(reader_task_guard);
+        });
 
         Arc::new(Self {
             close_timeout_started: AtomicBool::new(false),
@@ -159,6 +188,8 @@ impl ConnectionDriver {
             shutdown,
             state,
             state_sender,
+            tasks_remaining,
+            tasks_remaining_sender,
             writer_abort,
         })
     }
@@ -168,6 +199,48 @@ impl ConnectionDriver {
         let message_size = message.len();
         let admission = self.try_admit_outbound(message_size)?;
         self.send_admitted(admission, message).await
+    }
+
+    #[cfg(test)]
+    pub async fn wait_for_peer_close_for_test(&self) -> Result<(), DriverError> {
+        let mut state = self.state.clone();
+        loop {
+            match state.borrow().clone() {
+                DriverState::PeerClosed(_) => return Ok(()),
+                DriverState::Closed(error) => return Err(error),
+                DriverState::Closing | DriverState::Open => {}
+            }
+            if state.changed().await.is_err() {
+                return Err(DriverError::Transport(
+                    "connection driver stopped before publishing peer close".to_owned(),
+                ));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn abort_reader_for_test(&self) {
+        self.reader_abort.abort();
+    }
+
+    #[cfg(test)]
+    pub async fn wait_for_terminal_for_test(&self) -> DriverError {
+        let mut state = self.state.clone();
+        loop {
+            if let DriverState::Closed(error) = state.borrow().clone() {
+                return error;
+            }
+            if state.changed().await.is_err() {
+                return DriverError::Transport(
+                    "connection driver stopped before publishing terminal state".to_owned(),
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn tasks_remaining_for_test(&self) -> usize {
+        *self.tasks_remaining.borrow()
     }
 
     pub fn try_admit_outbound(
@@ -248,22 +321,24 @@ impl ConnectionDriver {
     }
 
     pub async fn close(self: &Arc<Self>) -> Result<(), DriverError> {
-        if let DriverState::Closed(error) = self.state.borrow().clone() {
-            return close_result(error);
-        }
-
-        self.begin_close();
-        let mut state = self.state.clone();
-        loop {
-            if let DriverState::Closed(error) = state.borrow().clone() {
-                return close_result(error);
+        let terminal = if let DriverState::Closed(error) = self.state.borrow().clone() {
+            error
+        } else {
+            self.begin_close();
+            let mut state = self.state.clone();
+            loop {
+                if let DriverState::Closed(error) = state.borrow().clone() {
+                    break error;
+                }
+                if state.changed().await.is_err() {
+                    break DriverError::Transport(
+                        "connection driver stopped before publishing a terminal state".to_owned(),
+                    );
+                }
             }
-            if state.changed().await.is_err() {
-                return Err(DriverError::Transport(
-                    "connection driver stopped before publishing a terminal state".to_owned(),
-                ));
-            }
-        }
+        };
+        wait_for_driver_tasks(self.tasks_remaining.clone()).await?;
+        close_result(terminal)
     }
 
     pub fn abort(&self) {
@@ -276,34 +351,40 @@ impl ConnectionDriver {
     }
 
     fn begin_close(self: &Arc<Self>) {
+        let watchdog_guard = DriverTaskGuard::new(&self.tasks_remaining_sender);
         let first_close = !self.closing.swap(true, Ordering::AcqRel);
-        let started_local_close = first_close
-            && self.state_sender.send_if_modified(|state| {
-                if matches!(state, DriverState::Open) {
-                    *state = DriverState::Closing;
-                    true
-                } else {
-                    false
-                }
-            });
-        if started_local_close {
-            signal_local_close(&self.shutdown);
+        if !first_close {
+            return;
         }
+        let started_local_close = self.state_sender.send_if_modified(|state| {
+            if matches!(state, DriverState::Open) {
+                *state = DriverState::Closing;
+                true
+            } else {
+                false
+            }
+        });
+        if !started_local_close {
+            return;
+        }
+        signal_local_close(&self.shutdown);
 
-        if started_local_close && !self.close_timeout_started.swap(true, Ordering::AcqRel) {
-            let timeout = self.config.close_timeout;
-            let state = self.state_sender.subscribe();
-            let state_sender = self.state_sender.clone();
-            let reader_abort = self.reader_abort.clone();
-            let writer_abort = self.writer_abort.clone();
-            tokio::spawn(async move {
-                if close_timeout_expired(state, timeout).await {
-                    publish_close_timeout(&state_sender);
-                    reader_abort.abort();
-                    writer_abort.abort();
-                }
-            });
+        if self.close_timeout_started.swap(true, Ordering::AcqRel) {
+            return;
         }
+        let timeout = self.config.close_timeout;
+        let state = self.state_sender.subscribe();
+        let state_sender = self.state_sender.clone();
+        let reader_abort = self.reader_abort.clone();
+        let writer_abort = self.writer_abort.clone();
+        tokio::spawn(async move {
+            if close_timeout_expired(state, timeout).await {
+                publish_close_timeout(&state_sender);
+                reader_abort.abort();
+                writer_abort.abort();
+            }
+            drop(watchdog_guard);
+        });
     }
 
     fn ensure_open(&self) -> Result<(), DriverError> {
@@ -379,24 +460,9 @@ async fn run_reader<Socket>(
             break;
         };
         match result {
-            Ok(Message::Text(payload)) => {
-                let message = InboundMessage::Text(payload.to_string());
+            Ok(payload @ (Message::Text(_) | Message::Binary(_))) => {
                 if queue_inbound(
-                    message,
-                    &context.inbound,
-                    &context.inbound_budget,
-                    &mut context.shutdown_receiver,
-                )
-                .await
-                .is_err()
-                {
-                    break;
-                }
-            }
-            Ok(Message::Binary(payload)) => {
-                let message = InboundMessage::Binary(payload.to_vec());
-                if queue_inbound(
-                    message,
+                    payload,
                     &context.inbound,
                     &context.inbound_budget,
                     &mut context.shutdown_receiver,
@@ -468,7 +534,7 @@ fn finish_reader_failure(context: &ReaderContext, terminal: &DriverError) {
 }
 
 async fn queue_inbound(
-    message: InboundMessage,
+    payload: Message,
     inbound: &mpsc::Sender<InboundEnvelope>,
     inbound_budget: &Arc<Semaphore>,
     shutdown: &mut watch::Receiver<ShutdownSignal>,
@@ -476,7 +542,7 @@ async fn queue_inbound(
     if *shutdown.borrow() != ShutdownSignal::Running {
         return Ok(());
     }
-    let permit_count = u32::try_from(message.len()).map_err(|_| ())?;
+    let permit_count = u32::try_from(payload.len()).map_err(|_| ())?;
     let permit = tokio::select! {
         result = Arc::clone(inbound_budget).acquire_many_owned(permit_count) => {
             result.map_err(|_| ())?
@@ -484,6 +550,13 @@ async fn queue_inbound(
         result = shutdown.changed() => {
             result.map_err(|_| ())?;
             return Ok(());
+        }
+    };
+    let message = match payload {
+        Message::Text(payload) => InboundMessage::Text(payload.to_string()),
+        Message::Binary(payload) => InboundMessage::Binary(payload.to_vec()),
+        Message::Close(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+            return Err(());
         }
     };
     let envelope = InboundEnvelope {
@@ -520,7 +593,7 @@ async fn run_writer<Socket>(
                     }
                     let close_result = close_writer(&mut writer, signal, &mut shutdown).await;
                     if let Err(error) = close_result {
-                        publish_writer_close_error(&state, &error);
+                        publish_writer_failure(&state, &error);
                         signal_abort(&shutdown_sender);
                     } else if let Some(outcome) = peer_close_outcome(&state) {
                         publish_terminal(&state, &outcome);
@@ -528,33 +601,60 @@ async fn run_writer<Socket>(
                     return;
                 }
             }
-            command = control.recv() => {
-                if command.is_some() && writer.flush().await.is_err() {
-                    publish_terminal(
-                        &state,
-                        &DriverError::Transport("WebSocket control flush failed".to_owned()),
-                    );
-                    signal_abort(&shutdown_sender);
-                    return;
-                }
-            }
-            command = outbound.recv() => {
-                let Some(command) = command else {
-                    return;
-                };
-                let result = writer
-                    .send(command.message)
-                    .await
-                    .map_err(|error| DriverError::Transport(format!("WebSocket send failed: {error}")));
-                let terminal = result.as_ref().err().cloned();
-                let _ = command.response.send(result);
-                if let Some(error) = terminal {
-                    publish_terminal(&state, &error);
-                    signal_abort(&shutdown_sender);
-                    return;
+            event = next_writer_event(&mut control, &mut outbound) => {
+                match event {
+                    WriterEvent::Control(Some(WriterControl::Flush)) => {
+                        if writer.flush().await.is_err() {
+                            publish_writer_failure(
+                                &state,
+                                &DriverError::Transport("WebSocket control flush failed".to_owned()),
+                            );
+                            signal_abort(&shutdown_sender);
+                            return;
+                        }
+                    }
+                    WriterEvent::Control(None) => {
+                        publish_writer_failure(
+                            &state,
+                            &DriverError::Transport(
+                                "connection reader stopped unexpectedly".to_owned(),
+                            ),
+                        );
+                        signal_abort(&shutdown_sender);
+                        return;
+                    }
+                    WriterEvent::Outbound(command) => {
+                        let Some(command) = command else {
+                            return;
+                        };
+                        match writer.send(command.message).await {
+                            Ok(()) => {
+                                let _ = command.response.send(Ok(()));
+                            }
+                            Err(error) => {
+                                let error = DriverError::Transport(format!(
+                                    "WebSocket send failed: {error}",
+                                ));
+                                let terminal = publish_writer_failure(&state, &error);
+                                signal_abort(&shutdown_sender);
+                                let _ = command.response.send(Err(terminal));
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+async fn next_writer_event(
+    control: &mut mpsc::Receiver<WriterControl>,
+    outbound: &mut mpsc::Receiver<OutboundCommand>,
+) -> WriterEvent {
+    tokio::select! {
+        command = control.recv() => WriterEvent::Control(command),
+        command = outbound.recv() => WriterEvent::Outbound(command),
     }
 }
 
@@ -599,19 +699,20 @@ fn peer_close_outcome(state: &watch::Sender<DriverState>) -> Option<DriverError>
     }
 }
 
-fn publish_writer_close_error(state: &watch::Sender<DriverState>, error: &DriverError) {
+fn publish_writer_failure(state: &watch::Sender<DriverState>, error: &DriverError) -> DriverError {
+    let mut terminal = error.clone();
     let _ = state.send_if_modified(|current| {
+        terminal = match current {
+            DriverState::Closed(outcome) | DriverState::PeerClosed(outcome) => outcome.clone(),
+            DriverState::Closing | DriverState::Open => error.clone(),
+        };
         if current.is_terminal() {
             return false;
         }
-        let terminal = match current {
-            DriverState::PeerClosed(outcome) => outcome.clone(),
-            DriverState::Closing | DriverState::Open => error.clone(),
-            DriverState::Closed(_) => unreachable!(),
-        };
-        *current = DriverState::Closed(terminal);
+        *current = DriverState::Closed(terminal.clone());
         true
     });
+    terminal
 }
 
 fn classify_close(frame: Option<CloseFrame>, initiated_by_local: bool) -> DriverError {
@@ -722,6 +823,20 @@ async fn wait_for_terminal_state(mut receiver: watch::Receiver<DriverState>) {
     }
 }
 
+async fn wait_for_driver_tasks(mut remaining: watch::Receiver<usize>) -> Result<(), DriverError> {
+    while *remaining.borrow() != 0 {
+        if remaining.changed().await.is_err() {
+            if *remaining.borrow() == 0 {
+                return Ok(());
+            }
+            return Err(DriverError::Transport(
+                "connection tasks stopped without completion confirmation".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn close_timeout_expired(
     state: watch::Receiver<DriverState>,
     timeout: std::time::Duration,
@@ -741,14 +856,18 @@ fn close_result(error: DriverError) -> Result<(), DriverError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
-    use tokio::{sync::watch, time::timeout};
+    use tokio::{
+        sync::{Semaphore, mpsc, oneshot, watch},
+        time::timeout,
+    };
+    use tokio_tungstenite::tungstenite::Message;
 
     use super::{
-        DriverState, ShutdownSignal, classify_close, close_timeout_expired, publish_close_timeout,
-        publish_terminal, publish_writer_close_error, signal_abort, signal_local_close,
-        signal_peer_close,
+        DriverState, OutboundCommand, ShutdownSignal, WriterControl, WriterEvent, classify_close,
+        close_timeout_expired, next_writer_event, publish_close_timeout, publish_terminal,
+        publish_writer_failure, signal_abort, signal_local_close, signal_peer_close,
     };
     use crate::error::{CloseInfo, DriverError};
 
@@ -763,6 +882,40 @@ mod tests {
             .expect("close watchdog kept sleeping after terminal state")
             .unwrap();
         assert!(!expired);
+    }
+
+    #[tokio::test]
+    async fn writer_event_selection_does_not_starve_outbound_work() {
+        let (control_sender, mut control) = mpsc::channel(1);
+        let (outbound_sender, mut outbound) = mpsc::channel(1);
+        control_sender.send(WriterControl::Flush).await.unwrap();
+        let (response, _response_receiver) = oneshot::channel();
+        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        outbound_sender
+            .send(OutboundCommand {
+                message: Message::Text("application".into()),
+                response,
+                _permit: permit,
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..64 {
+            match next_writer_event(&mut control, &mut outbound).await {
+                WriterEvent::Control(Some(WriterControl::Flush)) => {
+                    control_sender.send(WriterControl::Flush).await.unwrap();
+                }
+                WriterEvent::Outbound(Some(command)) => {
+                    assert_eq!(command.message, Message::Text("application".into()));
+                    return;
+                }
+                WriterEvent::Control(None) | WriterEvent::Outbound(None) => {
+                    panic!("writer event channel closed during fairness probe");
+                }
+            }
+        }
+
+        panic!("outbound work was starved by a continuously ready control queue");
     }
 
     #[test]
@@ -823,11 +976,12 @@ mod tests {
         });
         let (state, receiver) = watch::channel(DriverState::PeerClosed(outcome.clone()));
 
-        publish_writer_close_error(
+        let selected = publish_writer_failure(
             &state,
             &DriverError::Transport("close reply failed".to_owned()),
         );
 
-        assert_eq!(*receiver.borrow(), DriverState::Closed(outcome));
+        assert_eq!(*receiver.borrow(), DriverState::Closed(outcome.clone()));
+        assert_eq!(selected, outcome);
     }
 }

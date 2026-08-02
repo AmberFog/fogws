@@ -27,9 +27,13 @@ with two worker threads. Connections don't create or stop runtimes. Network
 waits run without the GIL. The runtime lives until process exit and has no
 public shutdown operation.
 
-FogWS fails closed if a loaded module is used after `fork()` or from a second
-Python subinterpreter. Start a fresh interpreter process instead. A connection
-may only be used on its creating asyncio loop.
+FogWS raises `RuntimeContextError` before starting new native work if a loaded
+module is used after `fork()`. The native extension rejects import from a
+Python subinterpreter with `ImportError`, before FogWS can initialize a runtime
+or start network work. An inherited connection's native driver is
+quarantined without touching Tokio state until the child exits or replaces its
+process image. Start a fresh interpreter process instead. A connection may only
+be used on its creating asyncio loop.
 
 `close()` is idempotent. It publishes the closing state before awaiting the
 peer and continues native cleanup if its Python waiter is canceled. Local and
@@ -50,18 +54,19 @@ connection.
 
 Defaults are intentionally finite:
 
-- `DEFAULT_MAX_QUEUE = 16` accepted messages in each direction;
+- `DEFAULT_MAX_QUEUE = 16` queued messages in each direction;
 - `DEFAULT_MAX_MESSAGE_SIZE = 1 MiB` for a frame or complete message;
-- `DEFAULT_MAX_BUFFERED_BYTES = 1 MiB` for each inbound and outbound queue;
+- `DEFAULT_MAX_BUFFERED_BYTES = 1 MiB` for each direction's byte-permit budget;
 - 16 KiB eager Tungstenite read buffer;
 - zero-byte target write buffer and a 1 MiB payload budget plus one bounded
   RFC 6455 frame header for the maximum write buffer;
 - `DEFAULT_CLOSE_TIMEOUT = 10 seconds`.
 
-The inbound reader may hold one additional message, bounded by
-`max_message_size`, while it waits for queue byte capacity. Outbound byte
-permits remain attached through flush or terminal failure. Outbound queue or
-byte saturation fails immediately with `ResourceLimitError`; inbound
+The inbound reader may hold one additional materialized message, bounded by
+`max_message_size`, outside the byte budget while it waits for queue capacity.
+The outbound writer may hold one message outside its item queue, but that
+message keeps its byte permit through flush or terminal failure. Outbound queue
+or byte saturation fails immediately with `ResourceLimitError`; inbound
 saturation applies bounded backpressure to the Rust reader. Neither path
 creates an unbounded waiter queue.
 
@@ -84,7 +89,9 @@ to abandon a backpressured connection.
 | abnormal close or transport failure | `ConnectionClosedError` | terminal state stops both paths and releases permits |
 | explicit close | `None`; repeated close has the same successful result | close is sent on a separate control path and cleanup is bounded |
 | canceled close waiter | `CancelledError` for that waiter | native close and timeout watchdog continue |
-| cross-loop, post-fork or second-interpreter use | typed fail-closed error | no new Rust future or network operation starts |
+| cross-loop use | `LoopAffinityError` | no new Rust future or network operation starts |
+| post-fork use | `RuntimeContextError` | no inherited Rust future or network operation is reused |
+| subinterpreter import | `ImportError` from the native extension boundary | no runtime or network operation starts |
 
 Secure `wss://`, headers, subprotocols, redirects, proxies, reconnect,
 keepalive, compression, fragments, metrics, telemetry, sync APIs and server

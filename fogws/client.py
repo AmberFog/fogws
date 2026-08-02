@@ -22,7 +22,11 @@ __all__ = ("Connection", "connect")
 class Connection:  # noqa: WPS214
     """A loop-bound, whole-message WebSocket connection backed by Rust."""
 
-    __slots__ = ("_native", "_pending_receive", "_receive_waiter_active")
+    __slots__ = (
+        "_native",
+        "_pending_receive",
+        "_receive_waiter_active",
+    )
 
     def __init__(self, native: _Connection) -> None:
         self._native = native
@@ -31,7 +35,9 @@ class Connection:  # noqa: WPS214
 
     # Native abort is required when asyncio is already unable to schedule cleanup.
     def __del__(self) -> None:  # noqa: WPS603
-        self._native._abort()  # noqa: SLF001  # Private native lifecycle hook.
+        self._native._abort(  # noqa: SLF001  # Private native lifecycle hook.
+            self._pending_receive,
+        )
 
     async def send_text(self, payload: str) -> None:
         """Send one complete UTF-8 text message."""
@@ -43,21 +49,17 @@ class Connection:  # noqa: WPS214
 
     async def receive(self) -> str | bytes:
         """Receive one complete text or binary message."""
-        if self._receive_waiter_active:
-            msg = "only one receive operation may be active per connection"
-            raise ConcurrencyError(
-                msg,
-            )
-        self._receive_waiter_active = True
+        self._native._ensure_context()  # noqa: SLF001  # Required before retained-Future reuse.
+        self._claim_receive_waiter()
         pending_receive = self._pending_receive
-        if pending_receive is None:
-            pending_receive = asyncio.ensure_future(self._native.receive())
-            pending_receive.add_done_callback(_observe_receive_completion)
-            self._pending_receive = pending_receive
         try:
+            if pending_receive is None:
+                pending_receive = asyncio.ensure_future(self._native.receive())
+                pending_receive.add_done_callback(_observe_receive_completion)
+                self._pending_receive = pending_receive
             message = await asyncio.shield(pending_receive)
         except asyncio.CancelledError:
-            if pending_receive.cancelled():
+            if pending_receive is not None and pending_receive.cancelled():
                 self._pending_receive = None
             raise
         except BaseException:
@@ -83,6 +85,14 @@ class Connection:  # noqa: WPS214
         traceback: TracebackType | None,
     ) -> None:
         await self.close()
+
+    def _claim_receive_waiter(self) -> None:
+        if self._receive_waiter_active:
+            msg = "only one receive operation may be active per connection"
+            raise ConcurrencyError(
+                msg,
+            )
+        self._receive_waiter_active = True
 
 
 async def connect(
