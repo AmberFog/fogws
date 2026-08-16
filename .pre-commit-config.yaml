@@ -54,4 +54,8 @@ repos:
     hooks:
       - id: mypy
         args: [--config-file=pyproject.toml, --install-types, --non-interactive]
+        additional_dependencies:
+          - pytest>=8,<9
+          - pytest-asyncio>=1,<2
+          - websockets==16.1.1
         files: ^(fogws|tests)/.*\.pyi?$

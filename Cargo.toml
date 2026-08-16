@@ -21,6 +21,36 @@ extension-module = ["pyo3/extension-module"]
 version = "0.29.0"
 features = ["abi3-py311"]
 
+[dependencies.futures-util]
+version = "0.3.31"
+default-features = false
+features = [
+    "sink",
+    "std",
+]
+
+[dependencies.pyo3-async-runtimes]
+version = "=0.29.0"
+features = ["tokio-runtime"]
+
+[dependencies.tokio]
+version = "1.53.1"
+features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+]
+
+[dependencies.tokio-tungstenite]
+version = "=0.30.0"
+default-features = false
+features = [
+    "connect",
+    "handshake",
+]
+
 [lints.rust]
 unsafe_code = "forbid"
 

@@ -10,13 +10,36 @@ import textwrap
 SMOKE_SCRIPT = textwrap.dedent(
     """
     from importlib.metadata import version
+    from pathlib import Path
 
     import fogws
 
 
     distribution_version = version("fogws")
     assert distribution_version == fogws.__version__
-    assert fogws.__all__ == ("__version__",)
+    assert fogws.__all__ == (
+        "DEFAULT_CLOSE_TIMEOUT",
+        "DEFAULT_MAX_BUFFERED_BYTES",
+        "DEFAULT_MAX_MESSAGE_SIZE",
+        "DEFAULT_MAX_QUEUE",
+        "ConcurrencyError",
+        "Connection",
+        "ConnectionClosed",
+        "ConnectionClosedError",
+        "ConnectionClosedOK",
+        "ConnectionFailedError",
+        "FogWSError",
+        "InvalidURIError",
+        "LoopAffinityError",
+        "ResourceLimitError",
+        "RuntimeContextError",
+        "__version__",
+        "connect",
+    )
+    assert all(hasattr(fogws, name) for name in fogws.__all__)
+    package_dir = Path(fogws.__file__).parent
+    assert (package_dir / "py.typed").is_file()
+    assert (package_dir / "_fogws.pyi").is_file()
     """,
 )
 
